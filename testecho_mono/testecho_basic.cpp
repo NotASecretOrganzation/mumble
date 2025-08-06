@@ -9,43 +9,43 @@
 #include <speex/speex_echo.h>
 #include <speex/speex_preprocess.h>
 
-// 基本實時回音消除示例
+// Basic real-time echo cancellation example using Mumble's state machine
 class BasicEchoCancellation {
 private:
-    // 音頻參數 - 基於 Mumble 的配置
-    static const int TARGET_SAMPLE_RATE = 48000;  // Mumble 使用 48kHz
-    static const int FRAME_SIZE_MS = 10;          // 10ms 幀
+    // Audio parameters - based on Mumble's configuration
+    static const int TARGET_SAMPLE_RATE = 48000;  // Mumble uses 48kHz
+    static const int FRAME_SIZE_MS = 10;          // 10ms frame
     static const int FRAME_SIZE = (TARGET_SAMPLE_RATE * FRAME_SIZE_MS) / 1000;  // 480 samples
-    static const int FILTER_LENGTH_MS = 100;      // 100ms 濾波器長度
+    static const int FILTER_LENGTH_MS = 100;      // 100ms filter length
     static const int FILTER_LENGTH = (TARGET_SAMPLE_RATE * FILTER_LENGTH_MS) / 1000;
-    static const int CHANNELS = 1;                // 單聲道
-    static const int MAX_BUFFER_SIZE = 50;        // 最大緩衝區大小
+    static const int CHANNELS = 1;                // Mono
+    static const int MAX_BUFFER_SIZE = 50;        // Maximum buffer size
 
-    // PortAudio 流
+    // PortAudio streams
     PaStream* micStream;
     PaStream* outputStream;
 
-    // Speex 組件
+    // Speex components
     SpeexEchoState* echoState;
     SpeexPreprocessState* preprocessState;
 
-    // 音頻緩衝區
-    std::queue<std::vector<int16_t>> micBuffer;
+    // Mumble's state machine for synchronization
+    std::queue<std::vector<int16_t>> micQueue;
+    std::mutex syncMutex;
+    std::condition_variable syncCondition;
+    
+    // State machine states (0-5 like Mumble)
+    int state = 0;
+    
+    // Audio buffers
     std::queue<std::vector<int16_t>> outputBuffer;
-
-    // 同步機制
-    std::mutex micMutex;
     std::mutex outputMutex;
-    std::condition_variable micCondition;
     std::atomic<bool> running;
 
-    // 處理線程
+    // Processing thread
     std::thread processingThread;
 
-    // 模擬揚聲器數據（用於測試）
-    std::vector<int16_t> dummySpeakerData;
-
-    // 統計信息
+    // Statistics
     std::atomic<int64_t> processedFrames;
     std::atomic<int64_t> droppedFrames;
 
@@ -58,9 +58,6 @@ public:
         running(false),
         processedFrames(0),
         droppedFrames(0) {
-        
-        // 創建模擬揚聲器數據（靜音）
-        dummySpeakerData.resize(FRAME_SIZE, 0);
     }
 
     ~BasicEchoCancellation() {
@@ -68,58 +65,59 @@ public:
     }
 
     bool initialize() {
-        std::cout << "Initializing Basic Echo Cancellation..." << std::endl;
+        std::cout << "Initializing Basic Echo Cancellation with Mumble State Machine..." << std::endl;
 
-        // 初始化 PortAudio
+        // Initialize PortAudio
         PaError err = Pa_Initialize();
         if (err != paNoError) {
             std::cerr << "PortAudio initialization failed: " << Pa_GetErrorText(err) << std::endl;
             return false;
         }
 
-        // 初始化 Speex
+        // Initialize Speex
         if (!initializeSpeex()) {
             return false;
         }
 
-        // 設置音頻流
+        // Setup audio streams
         if (!setupAudioStreams()) {
             return false;
         }
 
         std::cout << "Initialization completed successfully!" << std::endl;
         std::cout << "Target: " << TARGET_SAMPLE_RATE << "Hz, " << CHANNELS << " channels" << std::endl;
+        std::cout << "Using Mumble's state machine for mic/speaker synchronization" << std::endl;
 
         return true;
     }
 
 private:
     bool initializeSpeex() {
-        // 初始化回音消除狀態 - 基於 Mumble 的配置
+        // Initialize echo cancellation state - based on Mumble's configuration
         echoState = speex_echo_state_init(FRAME_SIZE, FILTER_LENGTH);
         if (!echoState) {
             std::cerr << "Failed to initialize Speex echo state" << std::endl;
             return false;
         }
 
-        // 設置採樣率
+        // Set sampling rate
         int sampleRate = TARGET_SAMPLE_RATE;
         speex_echo_ctl(echoState, SPEEX_ECHO_SET_SAMPLING_RATE, &sampleRate);
 
-        // 初始化預處理器
+        // Initialize preprocessor
         preprocessState = speex_preprocess_state_init(FRAME_SIZE, TARGET_SAMPLE_RATE);
         if (!preprocessState) {
             std::cerr << "Failed to initialize Speex preprocess state" << std::endl;
             return false;
         }
 
-        // 關聯回音消除和預處理 - 基於 Mumble 的設計
+        // Associate echo cancellation and preprocessor - based on Mumble's design
         speex_preprocess_ctl(preprocessState, SPEEX_PREPROCESS_SET_ECHO_STATE, echoState);
 
-        // 配置預處理器 - 基於 Mumble 的設置
+        // Configure preprocessor - based on Mumble's settings
         int denoise = 1;
         int agc = 1;
-        int vad = 0;  // 禁用 VAD 以避免警告
+        int vad = 0;  // Disable VAD to avoid warnings
         int agcLevel = 8000;
         int agcMaxGain = 20000;
         int agcIncrement = 12;
@@ -137,7 +135,7 @@ private:
     }
 
     bool setupAudioStreams() {
-        // 設置麥克風輸入流
+        // Setup microphone input stream
         PaStreamParameters micParams;
         micParams.device = Pa_GetDefaultInputDevice();
         if (micParams.device == paNoDevice) {
@@ -150,7 +148,7 @@ private:
         micParams.suggestedLatency = Pa_GetDeviceInfo(micParams.device)->defaultLowInputLatency;
         micParams.hostApiSpecificStreamInfo = nullptr;
 
-        // 設置輸出流
+        // Setup output stream
         PaStreamParameters outputParams;
         outputParams.device = Pa_GetDefaultOutputDevice();
         if (outputParams.device == paNoDevice) {
@@ -163,7 +161,7 @@ private:
         outputParams.suggestedLatency = Pa_GetDeviceInfo(outputParams.device)->defaultLowOutputLatency;
         outputParams.hostApiSpecificStreamInfo = nullptr;
 
-        // 打開麥克風流
+        // Open microphone stream
         PaError err = Pa_OpenStream(&micStream,
             &micParams,
             nullptr,
@@ -178,7 +176,7 @@ private:
             return false;
         }
 
-        // 打開輸出流
+        // Open output stream
         err = Pa_OpenStream(&outputStream,
             nullptr,
             &outputParams,
@@ -197,7 +195,7 @@ private:
     }
 
 public:
-    // 麥克風回調
+    // Microphone callback - using Mumble's AddMic approach
     static int micCallback(const void* inputBuffer, void* outputBuffer,
         unsigned long framesPerBuffer,
         const PaStreamCallbackTimeInfo* timeInfo,
@@ -209,23 +207,15 @@ public:
 
         if (input) {
             std::vector<int16_t> frame(input, input + framesPerBuffer);
-
-            std::lock_guard<std::mutex> lock(ec->micMutex);
-            ec->micBuffer.push(frame);
-
-            // 限制緩衝區大小
-            while (ec->micBuffer.size() > MAX_BUFFER_SIZE) {
-                ec->micBuffer.pop();
-                ec->droppedFrames++;
-            }
-
-            ec->micCondition.notify_one();
+            
+            // Use Mumble's AddMic approach
+            ec->addMic(frame);
         }
 
         return paContinue;
     }
 
-    // 輸出回調
+    // Output callback
     static int outputCallback(const void* inputBuffer, void* outputBuffer,
         unsigned long framesPerBuffer,
         const PaStreamCallbackTimeInfo* timeInfo,
@@ -244,52 +234,118 @@ public:
 
             std::copy(frame.begin(), frame.end(), output);
         } else {
-            // 輸出靜音
+            // Output silence
             std::fill(output, output + framesPerBuffer, 0);
         }
 
         return paContinue;
     }
 
-    // 音頻處理 - 基於 Mumble 的邏輯
+    // Mumble's AddMic state machine approach
+    void addMic(const std::vector<int16_t>& micData) {
+        bool drop = false;
+        
+        {
+            std::lock_guard<std::mutex> lock(syncMutex);
+            micQueue.push(micData);
+            
+            // Mumble's simple state machine: 0->1->2->3->4->5 (drop)
+            if (state < 5) {
+                state++;
+            } else {
+                drop = true;
+                micQueue.pop(); // Remove the frame we just added
+            }
+        }
+        
+        if (drop) {
+            droppedFrames++;
+        }
+        
+        syncCondition.notify_one();
+    }
+
+    // Mumble's AddSpeaker state machine approach
+    std::pair<std::vector<int16_t>, std::vector<int16_t>> addSpeaker(const std::vector<int16_t>& speakerData) {
+        std::vector<int16_t> micData;
+        bool drop = false;
+        
+        {
+            std::lock_guard<std::mutex> lock(syncMutex);
+            
+            // Mumble's simple state machine: 5->4->3->2->1->0 (drop)
+            if (state > 0) {
+                state--;
+                if (!micQueue.empty()) {
+                    micData = micQueue.front();
+                    micQueue.pop();
+                }
+            } else {
+                drop = true;
+            }
+        }
+        
+        if (drop) {
+            droppedFrames++;
+            return {{}, {}}; // Return empty pair
+        }
+        
+        return {micData, speakerData};
+    }
+
+    // Audio processing using Mumble's state machine
     void processAudio() {
         std::vector<int16_t> micFrame(FRAME_SIZE);
         std::vector<int16_t> outputFrame(FRAME_SIZE);
+        
+        // Create dummy speaker data for testing (silence)
+        std::vector<int16_t> dummySpeakerData(FRAME_SIZE, 0);
 
-        std::cout << "Audio processing started" << std::endl;
+        std::cout << "Audio processing started with Mumble state machine" << std::endl;
         std::cout << "Note: Using dummy speaker data for echo cancellation testing" << std::endl;
 
         while (running) {
-            // 等待麥克風數據
-            std::unique_lock<std::mutex> micLock(micMutex);
-            micCondition.wait(micLock, [this] { return !micBuffer.empty() || !running; });
+            // Wait for microphone data
+            std::unique_lock<std::mutex> lock(syncMutex);
+            syncCondition.wait(lock, [this] { return !micQueue.empty() || !running; });
 
             if (!running) break;
 
-            if (!micBuffer.empty()) {
-                micFrame = micBuffer.front();
-                micBuffer.pop();
-                micLock.unlock();
+            if (!micQueue.empty()) {
+                // Get synchronized pair using Mumble's approach
+                std::pair<std::vector<int16_t>, std::vector<int16_t>> pair = addSpeaker(dummySpeakerData);
+                std::vector<int16_t> micData = pair.first;
+                std::vector<int16_t> speakerData = pair.second;
+                
+                if (!micData.empty() && !speakerData.empty()) {
+                    // Perform echo cancellation
+                    speex_echo_cancellation(echoState,
+                        speakerData.data(),
+                        micData.data(),
+                        outputFrame.data());
 
-                // 執行回音消除（使用模擬揚聲器數據）
-                speex_echo_cancellation(echoState,
-                    dummySpeakerData.data(),
-                    micFrame.data(),
-                    outputFrame.data());
+                    // Apply preprocessing - based on Mumble's speex_preprocess_run
+                    speex_preprocess_run(preprocessState, outputFrame.data());
 
-                // 應用預處理 - 基於 Mumble 的 speex_preprocess_run
-                speex_preprocess_run(preprocessState, outputFrame.data());
+                    // Add to output buffer
+                    std::lock_guard<std::mutex> outputLock(outputMutex);
+                    outputBuffer.push(outputFrame);
 
-                // 添加到輸出緩衝區
-                std::lock_guard<std::mutex> outputLock(outputMutex);
-                outputBuffer.push(outputFrame);
+                    // Limit output buffer size
+                    while (outputBuffer.size() > MAX_BUFFER_SIZE) {
+                        outputBuffer.pop();
+                    }
 
-                // 限制輸出緩衝區大小
-                while (outputBuffer.size() > MAX_BUFFER_SIZE) {
-                    outputBuffer.pop();
+                    processedFrames++;
+                    
+                    // Log every 100 frames
+                    if (processedFrames % 100 == 0) {
+                        std::cout << "Processed " << processedFrames << " frames - "
+                                  << "Dropped: " << droppedFrames << " - "
+                                  << "Queue: " << micQueue.size() << " - "
+                                  << "State: " << state << std::endl;
+                    }
                 }
-
-                processedFrames++;
             }
         }
     }
@@ -297,14 +353,14 @@ public:
     bool start() {
         if (running) return false;
 
-        std::cout << "Starting basic echo cancellation..." << std::endl;
+        std::cout << "Starting basic echo cancellation with Mumble state machine..." << std::endl;
 
         running = true;
 
-        // 啟動處理線程
+        // Start processing thread
         processingThread = std::thread(&BasicEchoCancellation::processAudio, this);
 
-        // 啟動麥克風流
+        // Start microphone stream
         PaError err = Pa_StartStream(micStream);
         if (err != paNoError) {
             std::cerr << "Failed to start mic stream: " << Pa_GetErrorText(err) << std::endl;
@@ -312,7 +368,7 @@ public:
             return false;
         }
 
-        // 啟動輸出流
+        // Start output stream
         err = Pa_StartStream(outputStream);
         if (err != paNoError) {
             std::cerr << "Failed to start output stream: " << Pa_GetErrorText(err) << std::endl;
@@ -322,6 +378,7 @@ public:
         }
 
         std::cout << "Basic echo cancellation started successfully!" << std::endl;
+        std::cout << "Using Mumble's state machine for synchronization" << std::endl;
         std::cout << "Note: Using dummy speaker data for testing" << std::endl;
         std::cout << "Press Enter to stop..." << std::endl;
 
@@ -335,14 +392,14 @@ public:
 
         running = false;
 
-        // 停止音頻流
+        // Stop audio streams
         if (micStream) Pa_StopStream(micStream);
         if (outputStream) Pa_StopStream(outputStream);
 
-        // 喚醒處理線程
-        micCondition.notify_all();
+        // Wake up processing thread
+        syncCondition.notify_all();
 
-        // 等待處理線程結束
+        // Wait for processing thread to end
         if (processingThread.joinable()) {
             processingThread.join();
         }
@@ -350,12 +407,13 @@ public:
         std::cout << "Basic echo cancellation stopped." << std::endl;
         std::cout << "Processed frames: " << processedFrames << std::endl;
         std::cout << "Dropped frames: " << droppedFrames << std::endl;
+        std::cout << "Final state: " << state << std::endl;
     }
 
     void cleanup() {
         stop();
 
-        // 關閉流
+        // Close streams
         if (micStream) {
             Pa_CloseStream(micStream);
             micStream = nullptr;
@@ -365,7 +423,7 @@ public:
             outputStream = nullptr;
         }
 
-        // 清理 Speex
+        // Cleanup Speex
         if (echoState) {
             speex_echo_state_destroy(echoState);
             echoState = nullptr;
@@ -375,7 +433,7 @@ public:
             preprocessState = nullptr;
         }
 
-        // 終止 PortAudio
+        // Terminate PortAudio
         Pa_Terminate();
     }
 };
@@ -383,7 +441,7 @@ public:
 int main() {
     std::cout << "=========================================" << std::endl;
     std::cout << "Basic Real-Time Echo Cancellation Demo" << std::endl;
-    std::cout << "Based on Mumble's Echo Cancellation Design" << std::endl;
+    std::cout << "Using Mumble's State Machine for Synchronization" << std::endl;
     std::cout << "=========================================" << std::endl;
 
     BasicEchoCancellation ec;
@@ -398,7 +456,7 @@ int main() {
         return -1;
     }
 
-    // 等待用戶輸入停止
+    // Wait for user input to stop
     std::cin.get();
 
     ec.stop();
