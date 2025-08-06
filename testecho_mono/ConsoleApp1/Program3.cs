@@ -34,6 +34,8 @@ namespace MumbleEchoCancellation
         private static long _processedFrames = 0;
         private static long _droppedFrames = 0;
 
+        private static CancellationTokenSource _cancellationTokenSource = new CancellationTokenSource();
+
         public static async Task Main(string[] args)
         {
             Console.WriteLine("Mumble Simple Echo Cancellation");
@@ -45,7 +47,14 @@ namespace MumbleEchoCancellation
                 InitializeSpeexDSP();
                 StartAudio();
 
+                // Start a status monitoring task
+                var statusTask = Task.Run(StatusMonitor);
+
                 Console.ReadLine();
+
+                // Stop the system
+                _cancellationTokenSource.Cancel();
+                await statusTask;
             }
             catch (Exception ex)
             {
@@ -54,6 +63,35 @@ namespace MumbleEchoCancellation
             finally
             {
                 Cleanup();
+            }
+        }
+
+        private static async Task StatusMonitor()
+        {
+            var lastProcessed = 0L;
+            var lastDropped = 0L;
+            var reportCount = 0;
+
+            while (!_cancellationTokenSource.Token.IsCancellationRequested)
+            {
+                await Task.Delay(2000, _cancellationTokenSource.Token);
+                reportCount++;
+
+                var currentProcessed = Interlocked.Read(ref _processedFrames);
+                var currentDropped = Interlocked.Read(ref _droppedFrames);
+                var processedDelta = currentProcessed - lastProcessed;
+                var droppedDelta = currentDropped - lastDropped;
+
+                Console.WriteLine($"=== Status Report #{reportCount} ===");
+                Console.WriteLine($"Processed frames: {currentProcessed} (+{processedDelta})");
+                Console.WriteLine($"Dropped frames: {currentDropped} (+{droppedDelta})");
+                Console.WriteLine($"Mic queue size: {_micQueue.Count}");
+                Console.WriteLine($"State machine state: {_state}");
+                Console.WriteLine($"Processing rate: {processedDelta / 2.0:F1} frames/sec");
+                Console.WriteLine("================================");
+
+                lastProcessed = currentProcessed;
+                lastDropped = currentDropped;
             }
         }
 
@@ -142,12 +180,20 @@ namespace MumbleEchoCancellation
 
                     if (bytesRead > 0)
                     {
-                        // Use Mumble's simple approach: addSpeaker returns synchronized pair
+                        // Use Mumble's approach: addSpeaker returns synchronized pair
                         var (micData, speakerData) = AddSpeaker(resampledBuffer);
                         
                         if (micData != null && speakerData != null)
                         {
                             ProcessFrame(micData, speakerData);
+                        }
+                        else
+                        {
+                            // Log when we don't have synchronized data
+                            if (Interlocked.Read(ref _processedFrames) % 50 == 0)
+                            {
+                                Console.WriteLine($"No synchronized data - Mic Queue: {_micQueue.Count}, State: {_state}");
+                            }
                         }
                     }
                 }
@@ -162,8 +208,14 @@ namespace MumbleEchoCancellation
         {
             try
             {
-                // Use Mumble's simple approach: just add mic data to queue
+                // Use Mumble's approach: just add mic data to queue
                 AddMic(e.Buffer);
+                
+                // Log microphone data arrival
+                if (Interlocked.Read(ref _processedFrames) % 50 == 0)
+                {
+                    Console.WriteLine($"Mic data received - Queue: {_micQueue.Count}, State: {_state}");
+                }
             }
             catch (Exception ex)
             {
@@ -194,6 +246,7 @@ namespace MumbleEchoCancellation
             if (drop)
             {
                 Interlocked.Increment(ref _droppedFrames);
+                Console.WriteLine($"Dropped mic frame due to overflow - State: {_state}");
             }
         }
 
@@ -222,6 +275,7 @@ namespace MumbleEchoCancellation
             if (drop)
             {
                 Interlocked.Increment(ref _droppedFrames);
+                Console.WriteLine($"Dropped speaker frame due to underflow - State: {_state}");
                 return (null, null);
             }
             
