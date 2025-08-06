@@ -5,14 +5,14 @@ using SpeexDSPSharp.Core;
 using SpeexDSPSharp.Core.SafeHandlers;
 using System.Collections.Concurrent;
 
-// 基於 Mumble 的音頻參數配置
-const int TARGET_SAMPLE_RATE = 48000;  // Mumble 使用 48kHz
-const int FRAME_SIZE_MS = 10;          // 10ms 幀
+// Audio parameters based on Mumble's configuration
+const int TARGET_SAMPLE_RATE = 48000;  // Mumble uses 48kHz
+const int FRAME_SIZE_MS = 10;          // 10ms frame
 const int FRAME_SIZE = (TARGET_SAMPLE_RATE * FRAME_SIZE_MS) / 1000;  // 480 samples
-const int FILTER_LENGTH_MS = 100;      // 100ms 濾波器長度
+const int FILTER_LENGTH_MS = 100;      // 100ms filter length
 const int FILTER_LENGTH = (TARGET_SAMPLE_RATE * FILTER_LENGTH_MS) / 1000;  // 4800 samples
-const int CHANNELS = 1;                // 單聲道
-const int MAX_BUFFER_SIZE = 50;        // 最大緩衝區大小
+const int CHANNELS = 1;                // Mono channel
+const int MAX_BUFFER_SIZE = 50;        // Maximum buffer size
 
 var format = new WaveFormat(TARGET_SAMPLE_RATE, 16, CHANNELS);
 var bufferSize = FRAME_SIZE * 2; // 16-bit mono = 2 bytes per sample
@@ -25,45 +25,65 @@ Console.WriteLine($"Target Sample Rate: {TARGET_SAMPLE_RATE}Hz");
 Console.WriteLine($"Frame Size: {FRAME_SIZE} samples ({FRAME_SIZE_MS}ms)");
 Console.WriteLine($"Filter Length: {FILTER_LENGTH} samples ({FILTER_LENGTH_MS}ms)");
 Console.WriteLine($"Channels: {CHANNELS}");
+Console.WriteLine($"Buffer Size: {bufferSize} bytes per frame");
+Console.WriteLine($"Max Buffer Queue Size: {MAX_BUFFER_SIZE} frames");
+Console.WriteLine("=========================================");
 
-// 基於 Mumble 設計的回音消除器
+// Echo canceller based on Mumble's design
+Console.WriteLine("Initializing Mumble Echo Cancellation...");
 var echoCanceller = new MumbleEchoCancellation(FRAME_SIZE_MS, FILTER_LENGTH_MS, format);
+Console.WriteLine("Mumble Echo Cancellation initialized successfully!");
 
-// 音頻緩衝區 - 基於 Mumble 的 Resynchronizer 設計
+// Audio buffers - based on Mumble's Resynchronizer design
 var micBuffer = new ConcurrentQueue<byte[]>();
 var speakerBuffer = new ConcurrentQueue<byte[]>();
 var outputBuffer = new ConcurrentQueue<byte[]>();
 
-// 同步機制
+// Echo cancellation comparison buffers
+var originalMicBuffer = new ConcurrentQueue<byte[]>();
+var echoCancelledBuffer = new ConcurrentQueue<byte[]>();
+
+// Synchronization mechanism
 var processingCancellationToken = new CancellationTokenSource();
 var micProcessed = new ManualResetEvent(false);
 var speakerProcessed = new ManualResetEvent(false);
 
-// 統計信息
+// Statistics
 var processedFrames = 0L;
 var droppedFrames = 0L;
+var echoReductionFrames = 0L;
 
-// 系統音頻捕獲（揚聲器輸出監聽）
+// System audio capture (speaker output monitoring)
+Console.WriteLine("Setting up system audio capture (WASAPI Loopback)...");
 var systemAudioCapture = new WasapiLoopbackCapture();
+Console.WriteLine($"System audio format: {systemAudioCapture.WaveFormat}");
 
-// 創建緩衝區提供者來處理系統音頻
+// Create buffer provider for system audio processing
+Console.WriteLine("Creating system audio buffer...");
 var systemAudioBuffer = new BufferedWaveProvider(systemAudioCapture.WaveFormat)
 {
     BufferLength = bufferSize * 100,
     DiscardOnBufferOverflow = true
 };
+Console.WriteLine($"System audio buffer size: {systemAudioBuffer.BufferLength} bytes");
 
-// 創建重採樣器將系統音頻轉換為目標格式
+// Create resampler to convert system audio to target format
+Console.WriteLine("Creating system audio resampler...");
 var systemAudioResampler = new MediaFoundationResampler(systemAudioBuffer, format);
+Console.WriteLine($"Resampler: {systemAudioCapture.WaveFormat} -> {format}");
 
-// 麥克風錄音設備
+// Microphone recording device
+Console.WriteLine("Setting up microphone recording...");
 var recorder = new WaveInEvent()
 {
     WaveFormat = format,
     BufferMilliseconds = FRAME_SIZE_MS
 };
+Console.WriteLine($"Microphone format: {recorder.WaveFormat}");
+Console.WriteLine($"Microphone buffer: {recorder.BufferMilliseconds}ms");
 
-// 音頻輸出
+// Audio output
+Console.WriteLine("Setting up audio output...");
 var output = new WaveOutEvent();
 var playbackBuffer = new BufferedWaveProvider(format)
 {
@@ -71,33 +91,43 @@ var playbackBuffer = new BufferedWaveProvider(format)
     DiscardOnBufferOverflow = true
 };
 output.Init(playbackBuffer);
+Console.WriteLine($"Output format: {format}");
+Console.WriteLine($"Playback buffer size: {playbackBuffer.BufferLength} bytes");
 
-// 輸出 WAV 文件
+// Output WAV files for comparison
 var outputFile = $"aec_clean_{TARGET_SAMPLE_RATE}_{DateTime.Now:HHmmss}.wav";
+var originalFile = $"aec_original_{TARGET_SAMPLE_RATE}_{DateTime.Now:HHmmss}.wav";
+Console.WriteLine($"Output WAV file (echo cancelled): {outputFile}");
+Console.WriteLine($"Output WAV file (original): {originalFile}");
 var writer = new WaveFileWriter(outputFile, format);
+var originalWriter = new WaveFileWriter(originalFile, format);
+Console.WriteLine($"WAV writer format: {writer.WaveFormat}");
 
-// 基於 Mumble 的音頻處理線程
+// Audio processing task based on Mumble's design
+Console.WriteLine("Starting audio processing task...");
 var processingTask = Task.Run(async () =>
 {
-    Console.WriteLine("Audio processing started");
+    Console.WriteLine("Audio processing task started");
     Console.WriteLine("Echo cancellation mode: Enabled");
+    Console.WriteLine("Processing loop: Waiting for microphone data...");
 
     while (!processingCancellationToken.Token.IsCancellationRequested)
     {
         try
         {
-            // 等待麥克風數據 - 基於 Mumble 的 Resynchronizer 邏輯
+            // Wait for microphone data - based on Mumble's Resynchronizer logic
             if (micBuffer.TryDequeue(out var micData))
             {
-                // 獲取揚聲器數據
+                // Get speaker data
                 byte[] speakerData;
                 if (!speakerBuffer.TryDequeue(out speakerData))
                 {
-                    // 沒有揚聲器數據，使用靜音
+                    // No speaker data available, use silence
                     speakerData = new byte[bufferSize];
+                    Console.WriteLine("WARNING: No speaker data available, using silence");
                 }
 
-                // 確保緩衝區大小正確
+                // Ensure buffer sizes are correct
                 if (micData.Length != bufferSize)
                 {
                     Array.Resize(ref micData, bufferSize);
@@ -109,77 +139,110 @@ var processingTask = Task.Run(async () =>
 
                 var outputData = new byte[bufferSize];
 
-                // 執行回音消除 - 基於 Mumble 的 speex_echo_cancellation
+                // Store original microphone data for comparison
+                var originalMicData = new byte[bufferSize];
+                Buffer.BlockCopy(micData, 0, originalMicData, 0, bufferSize);
+                originalMicBuffer.Enqueue(originalMicData);
+
+                // Perform echo cancellation - based on Mumble's speex_echo_cancellation
                 echoCanceller.Cancel(micData, speakerData, outputData);
 
-                // 添加到輸出緩衝區
+                // Store echo cancelled data for comparison
+                echoCancelledBuffer.Enqueue(outputData);
+
+                // Add to output buffer
                 outputBuffer.Enqueue(outputData);
 
-                // 限制輸出緩衝區大小
+                // Limit output buffer size
                 while (outputBuffer.Count > MAX_BUFFER_SIZE)
                 {
                     outputBuffer.TryDequeue(out _);
                 }
 
-                // 寫入 WAV 文件
+                // Write to WAV files
                 writer.Write(outputData, 0, outputData.Length);
+                originalWriter.Write(originalMicData, 0, originalMicData.Length);
+
+                // Calculate echo reduction metrics
+                var echoReduction = CalculateEchoReduction(originalMicData, outputData);
+                if (echoReduction > 0)
+                {
+                    Interlocked.Increment(ref echoReductionFrames);
+                }
 
                 Interlocked.Increment(ref processedFrames);
+                
+                // Display detailed information every 100 frames
+                if (Interlocked.Read(ref processedFrames) % 100 == 0)
+                {
+                    Console.WriteLine($"Processed {Interlocked.Read(ref processedFrames)} frames - " +
+                                     $"Mic: {micData.Length} bytes, Speaker: {speakerData.Length} bytes, " +
+                                     $"Output: {outputData.Length} bytes, Echo Reduction: {echoReduction:F2}dB");
+                }
             }
             else
             {
-                // 沒有麥克風數據，等待一下
+                // No microphone data, wait a bit
                 await Task.Delay(1, processingCancellationToken.Token);
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error in audio processing: {ex.Message}");
+            Console.WriteLine($"ERROR in audio processing: {ex.Message}");
+            Console.WriteLine($"Stack trace: {ex.StackTrace}");
             await Task.Delay(10, processingCancellationToken.Token);
         }
     }
 }, processingCancellationToken.Token);
 
-// 系統音頻處理 - 基於 Mumble 的 addEcho 設計
+// System audio processing - based on Mumble's addEcho design
+Console.WriteLine("Setting up system audio processing callback...");
 systemAudioCapture.DataAvailable += (s, e) =>
 {
     try
     {
-        // 將捕獲的系統音頻添加到緩衝區
+        // Add captured system audio to buffer
         systemAudioBuffer.AddSamples(e.Buffer, 0, e.BytesRecorded);
 
-        // 重採樣系統音頻到目標格式
+        // Resample system audio to target format
         var resampledBuffer = new byte[bufferSize];
         int resampledBytes = systemAudioResampler.Read(resampledBuffer, 0, bufferSize);
 
         if (resampledBytes > 0)
         {
-            // 確保緩衝區大小正確
+            // Ensure buffer size is correct
             if (resampledBytes != bufferSize)
             {
                 Array.Resize(ref resampledBuffer, bufferSize);
+                Console.WriteLine($"WARNING: Resampled buffer size mismatch - Expected: {bufferSize}, Got: {resampledBytes}");
             }
 
-            // 添加到揚聲器緩衝區
+            // Add to speaker buffer
             speakerBuffer.Enqueue(resampledBuffer);
 
-            // 限制緩衝區大小
+            // Limit buffer size
             while (speakerBuffer.Count > MAX_BUFFER_SIZE)
             {
                 speakerBuffer.TryDequeue(out _);
             }
 
-            // 提供參考信號給回音消除器
+            // Provide reference signal to echo canceller
             echoCanceller.EchoPlayBack(resampledBuffer);
+        }
+        else
+        {
+            Console.WriteLine("WARNING: No resampled system audio data available");
         }
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"Error processing system audio: {ex.Message}");
+        Console.WriteLine($"ERROR processing system audio: {ex.Message}");
+        Console.WriteLine($"Stack trace: {ex.StackTrace}");
     }
 };
 
-// 麥克風錄音處理 - 基於 Mumble 的 AudioInput 設計
+// Microphone recording processing - based on Mumble's AudioInput design
+Console.WriteLine("Setting up microphone processing callback...");
 recorder.DataAvailable += (s, e) =>
 {
     try
@@ -187,31 +250,38 @@ recorder.DataAvailable += (s, e) =>
         var micData = new byte[bufferSize];
         Buffer.BlockCopy(e.Buffer, 0, micData, 0, Math.Min(e.BytesRecorded, bufferSize));
 
-        // 確保緩衝區大小正確
+        // Ensure buffer size is correct
         if (e.BytesRecorded != bufferSize)
         {
             Array.Resize(ref micData, bufferSize);
+            Console.WriteLine($"WARNING: Microphone buffer size mismatch - Expected: {bufferSize}, Got: {e.BytesRecorded}");
         }
 
-        // 添加到麥克風緩衝區
+        // Add to microphone buffer
         micBuffer.Enqueue(micData);
 
-        // 限制緩衝區大小
+        // Limit buffer size
         while (micBuffer.Count > MAX_BUFFER_SIZE)
         {
             micBuffer.TryDequeue(out _);
             Interlocked.Increment(ref droppedFrames);
+            Console.WriteLine("WARNING: Microphone buffer overflow, dropped frame");
         }
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"Error processing microphone audio: {ex.Message}");
+        Console.WriteLine($"ERROR processing microphone audio: {ex.Message}");
+        Console.WriteLine($"Stack trace: {ex.StackTrace}");
     }
 };
 
-// 音頻輸出處理
+// Audio output processing
+Console.WriteLine("Starting audio output task...");
 var outputTask = Task.Run(async () =>
 {
+    Console.WriteLine("Audio output task started");
+    var outputFrameCount = 0L;
+    
     while (!processingCancellationToken.Token.IsCancellationRequested)
     {
         try
@@ -219,79 +289,180 @@ var outputTask = Task.Run(async () =>
             if (outputBuffer.TryDequeue(out var outputData))
             {
                 playbackBuffer.AddSamples(outputData, 0, outputData.Length);
+                outputFrameCount++;
+                
+                // Display output status every 100 frames
+                if (outputFrameCount % 100 == 0)
+                {
+                    Console.WriteLine($"Output: {outputFrameCount} frames sent to playback buffer");
+                }
             }
             else
             {
-                // 沒有輸出數據，等待一下
+                // No output data, wait a bit
                 await Task.Delay(1, processingCancellationToken.Token);
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error in output processing: {ex.Message}");
+            Console.WriteLine($"ERROR in output processing: {ex.Message}");
+            Console.WriteLine($"Stack trace: {ex.StackTrace}");
             await Task.Delay(10, processingCancellationToken.Token);
         }
     }
 }, processingCancellationToken.Token);
 
-// 統計報告任務
+// Statistics reporting task
+Console.WriteLine("Starting statistics reporting task...");
 var statsTask = Task.Run(async () =>
 {
+    Console.WriteLine("Statistics reporting task started");
+    var reportCount = 0;
+    
     while (!processingCancellationToken.Token.IsCancellationRequested)
     {
-        await Task.Delay(5000, processingCancellationToken.Token); // 每5秒報告一次
+        await Task.Delay(5000, processingCancellationToken.Token); // Report every 5 seconds
+        reportCount++;
         
         var currentProcessed = Interlocked.Read(ref processedFrames);
         var currentDropped = Interlocked.Read(ref droppedFrames);
+        var currentEchoReduction = Interlocked.Read(ref echoReductionFrames);
         
-        Console.WriteLine($"Status - Processed: {currentProcessed}, Dropped: {currentDropped}, " +
-                         $"Mic Buffer: {micBuffer.Count}, Speaker Buffer: {speakerBuffer.Count}, " +
-                         $"Output Buffer: {outputBuffer.Count}");
+        Console.WriteLine($"=== Status Report #{reportCount} ===");
+        Console.WriteLine($"Processed frames: {currentProcessed}");
+        Console.WriteLine($"Dropped frames: {currentDropped}");
+        Console.WriteLine($"Drop rate: {(currentProcessed > 0 ? (double)currentDropped / currentProcessed * 100 : 0):F2}%");
+        Console.WriteLine($"Echo reduction frames: {currentEchoReduction}");
+        Console.WriteLine($"Echo reduction rate: {(currentProcessed > 0 ? (double)currentEchoReduction / currentProcessed * 100 : 0):F2}%");
+        Console.WriteLine($"Buffer status:");
+        Console.WriteLine($"  Microphone buffer: {micBuffer.Count}/{MAX_BUFFER_SIZE} frames");
+        Console.WriteLine($"  Speaker buffer: {speakerBuffer.Count}/{MAX_BUFFER_SIZE} frames");
+        Console.WriteLine($"  Output buffer: {outputBuffer.Count}/{MAX_BUFFER_SIZE} frames");
+        Console.WriteLine($"  Original buffer: {originalMicBuffer.Count}/{MAX_BUFFER_SIZE} frames");
+        Console.WriteLine($"  Echo cancelled buffer: {echoCancelledBuffer.Count}/{MAX_BUFFER_SIZE} frames");
+        Console.WriteLine($"System audio buffer: {systemAudioBuffer.BufferedBytes} bytes");
+        Console.WriteLine($"Playback buffer: {playbackBuffer.BufferedBytes} bytes");
+        Console.WriteLine("================================");
     }
 }, processingCancellationToken.Token);
 
-// 啟動所有組件
-Console.WriteLine("Starting real-time echo cancellation...");
+// Start all components
+Console.WriteLine("=========================================");
+Console.WriteLine("Starting all audio components...");
+Console.WriteLine("=========================================");
 
+Console.WriteLine("Starting system audio capture...");
 systemAudioCapture.StartRecording();
-recorder.StartRecording();
-output.Play();
+Console.WriteLine("System audio capture started successfully");
 
+Console.WriteLine("Starting microphone recording...");
+recorder.StartRecording();
+Console.WriteLine("Microphone recording started successfully");
+
+Console.WriteLine("Starting audio playback...");
+output.Play();
+Console.WriteLine("Audio playback started successfully");
+
+Console.WriteLine("=========================================");
 Console.WriteLine("Real-time echo cancellation started successfully!");
+Console.WriteLine("All components are running...");
 Console.WriteLine("Press Enter to stop...");
+Console.WriteLine("=========================================");
 
 Console.ReadLine();
 
-// 清理
+// Cleanup
+Console.WriteLine("=========================================");
 Console.WriteLine("Stopping real-time echo cancellation...");
+Console.WriteLine("=========================================");
 
+Console.WriteLine("Sending cancellation signal to all tasks...");
 processingCancellationToken.Cancel();
 
+Console.WriteLine("Stopping system audio capture...");
 systemAudioCapture.StopRecording();
+Console.WriteLine("System audio capture stopped");
+
+Console.WriteLine("Stopping microphone recording...");
 recorder.StopRecording();
+Console.WriteLine("Microphone recording stopped");
+
+Console.WriteLine("Stopping audio playback...");
 output.Stop();
+Console.WriteLine("Audio playback stopped");
 
-// 等待任務完成
-Task.WaitAll(new[] { processingTask, outputTask, statsTask }, 5000);
+// Wait for tasks to complete
+Console.WriteLine("Waiting for all tasks to complete...");
+var tasks = new[] { processingTask, outputTask, statsTask };
+var completed = Task.WaitAll(tasks, 5000);
+Console.WriteLine($"All tasks completed: {completed}");
 
-// 清理資源
+// Dispose resources
+Console.WriteLine("Disposing resources...");
 systemAudioResampler?.Dispose();
+Console.WriteLine("System audio resampler disposed");
+
 writer.Dispose();
+originalWriter.Dispose();
+Console.WriteLine("WAV writers disposed");
+
 echoCanceller.Dispose();
+Console.WriteLine("Echo canceller disposed");
 
 var finalProcessed = Interlocked.Read(ref processedFrames);
 var finalDropped = Interlocked.Read(ref droppedFrames);
+var finalEchoReduction = Interlocked.Read(ref echoReductionFrames);
 
+Console.WriteLine("=========================================");
 Console.WriteLine("Real-time echo cancellation stopped.");
-Console.WriteLine($"Final Stats - Processed frames: {finalProcessed}");
-Console.WriteLine($"Final Stats - Dropped frames: {finalDropped}");
-Console.WriteLine($"Output file: {outputFile}");
+Console.WriteLine("=========================================");
+Console.WriteLine($"Final Statistics:");
+Console.WriteLine($"  Processed frames: {finalProcessed}");
+Console.WriteLine($"  Dropped frames: {finalDropped}");
+Console.WriteLine($"  Drop rate: {(finalProcessed > 0 ? (double)finalDropped / finalProcessed * 100 : 0):F2}%");
+Console.WriteLine($"  Echo reduction frames: {finalEchoReduction}");
+Console.WriteLine($"  Echo reduction rate: {(finalProcessed > 0 ? (double)finalEchoReduction / finalProcessed * 100 : 0):F2}%");
+Console.WriteLine($"  Echo cancelled file: {outputFile}");
+Console.WriteLine($"  Original file: {originalFile}");
+Console.WriteLine($"  Echo cancelled file size: {new FileInfo(outputFile).Length} bytes");
+Console.WriteLine($"  Original file size: {new FileInfo(originalFile).Length} bytes");
+Console.WriteLine("=========================================");
+
+// Echo reduction calculation function
+static double CalculateEchoReduction(byte[] original, byte[] processed)
+{
+    if (original.Length != processed.Length || original.Length == 0)
+        return 0.0;
+
+    double originalEnergy = 0.0;
+    double processedEnergy = 0.0;
+
+    // Convert bytes to 16-bit samples and calculate energy
+    for (int i = 0; i < original.Length; i += 2)
+    {
+        if (i + 1 < original.Length)
+        {
+            short originalSample = BitConverter.ToInt16(original, i);
+            short processedSample = BitConverter.ToInt16(processed, i);
+            
+            originalEnergy += originalSample * originalSample;
+            processedEnergy += processedSample * processedSample;
+        }
+    }
+
+    if (originalEnergy <= 0 || processedEnergy <= 0)
+        return 0.0;
+
+    // Calculate echo reduction in dB
+    double echoReduction = 10 * Math.Log10(originalEnergy / processedEnergy);
+    return echoReduction;
+}
 
 namespace ConsoleApp1
 {
     /// <summary>
-    /// 基於 Mumble 設計的回音消除器
-    /// 使用 Mumble 的音頻參數和處理邏輯
+    /// Echo canceller based on Mumble's design
+    /// Uses Mumble's audio parameters and processing logic
     /// </summary>
     public class MumbleEchoCancellation : IDisposable
     {
@@ -308,7 +479,7 @@ namespace ConsoleApp1
             _waveFormat = format;
             _sampleRate = format.SampleRate;
 
-            // 計算幀大小和濾波器長度（基於 Mumble 的計算方式）
+            // Calculate frame size and filter length (based on Mumble's calculation method)
             _frameSize = (frameSizeMS * _sampleRate) / 1000;
             var filterLength = (filterLengthMS * _sampleRate) / 1000;
 
@@ -317,16 +488,16 @@ namespace ConsoleApp1
             Console.WriteLine($"  Filter Length: {filterLength} samples");
             Console.WriteLine($"  Sample Rate: {_sampleRate}Hz");
 
-            // 初始化回音消除器 - 基於 Mumble 的 speex_echo_state_init
+            // Initialize echo canceller - based on Mumble's speex_echo_state_init
             _canceller = new CustomSpeexDSPEchoCanceler(_frameSize, filterLength);
 
-            // 設置採樣率 - 基於 Mumble 的 speex_echo_ctl
+            // Set sampling rate - based on Mumble's speex_echo_ctl
             _canceller.Ctl(EchoCancellationCtl.SPEEX_ECHO_SET_SAMPLING_RATE, ref _sampleRate);
 
-            // 初始化預處理器 - 基於 Mumble 的 speex_preprocess_state_init
+            // Initialize preprocessor - based on Mumble's speex_preprocess_state_init
             _preprocessor = new CustomSpeexDSPPreprocessor(_frameSize, _sampleRate);
 
-            // 關聯回音消除和預處理 - 基於 Mumble 的設計
+            // Link echo cancellation and preprocessing - based on Mumble's design
             var echoStatePtr = _canceller.Handler.DangerousGetHandle();
             if (NativeSpeexDSP.speex_preprocess_ctl(_preprocessor.Handler, 
                 PreprocessorCtl.SPEEX_PREPROCESS_SET_ECHO_STATE.GetHashCode(), 
@@ -335,7 +506,7 @@ namespace ConsoleApp1
                 Console.WriteLine("Preprocessor linked with echo canceller successfully.");
             }
 
-            // 配置預處理器 - 基於 Mumble 的設置
+            // Configure preprocessor - based on Mumble's settings
             ConfigurePreprocessor();
         }
 
@@ -343,14 +514,14 @@ namespace ConsoleApp1
         {
             try
             {
-                // 基於 Mumble 的預處理器配置
-                int denoise = 1;        // 啟用降噪
-                int agc = 1;            // 啟用自動增益控制
-                int vad = 0;            // 禁用 VAD 以避免警告
-                int agcLevel = 8000;    // AGC 目標電平
-                int agcMaxGain = 20000; // AGC 最大增益
-                int agcIncrement = 12;  // AGC 增量
-                int agcDecrement = -40; // AGC 減量
+                // Preprocessor configuration based on Mumble's settings
+                int denoise = 1;        // Enable noise reduction
+                int agc = 1;            // Enable automatic gain control
+                int vad = 0;            // Disable VAD to avoid warnings
+                int agcLevel = 8000;    // AGC target level
+                int agcMaxGain = 20000; // AGC maximum gain
+                int agcIncrement = 12;  // AGC increment
+                int agcDecrement = -40; // AGC decrement
 
                 _preprocessor.Ctl(PreprocessorCtl.SPEEX_PREPROCESS_SET_DENOISE, ref denoise);
                 _preprocessor.Ctl(PreprocessorCtl.SPEEX_PREPROCESS_SET_AGC, ref agc);
@@ -374,14 +545,14 @@ namespace ConsoleApp1
         }
 
         /// <summary>
-        /// 執行回音消除 - 基於 Mumble 的 speex_echo_cancellation 和 speex_preprocess_run
+        /// Perform echo cancellation - based on Mumble's speex_echo_cancellation and speex_preprocess_run
         /// </summary>
-        /// <param name="referenceBuffer">揚聲器參考信號</param>
-        /// <param name="capturedBuffer">麥克風捕獲信號</param>
-        /// <param name="outputBuffer">回音消除後的輸出</param>
+        /// <param name="referenceBuffer">Speaker reference signal</param>
+        /// <param name="capturedBuffer">Microphone captured signal</param>
+        /// <param name="outputBuffer">Echo cancelled output</param>
         public void Cancel(byte[] referenceBuffer, byte[] capturedBuffer, byte[] outputBuffer)
         {
-            // 確保所有緩衝區大小正確
+            // Ensure all buffer sizes are correct
             var frameBytes = _frameSize * 2; // 16-bit = 2 bytes per sample
 
             if (referenceBuffer.Length != frameBytes ||
@@ -393,24 +564,24 @@ namespace ConsoleApp1
                 Array.Resize(ref outputBuffer, frameBytes);
             }
 
-            // 執行回音消除 - 基於 Mumble 的 speex_echo_cancellation
+            // Perform echo cancellation - based on Mumble's speex_echo_cancellation
             _canceller.EchoCancel(referenceBuffer, capturedBuffer, outputBuffer);
 
-            // 應用預處理 - 基於 Mumble 的 speex_preprocess_run
+            // Apply preprocessing - based on Mumble's speex_preprocess_run
             _preprocessor.Run(outputBuffer);
         }
 
         /// <summary>
-        /// 提供參考信號給回音消除器 - 基於 Mumble 的 addEcho 設計
+        /// Provide reference signal to echo canceller - based on Mumble's addEcho design
         /// </summary>
-        /// <param name="echoPlayback">系統音頻緩衝區</param>
+        /// <param name="echoPlayback">System audio buffer</param>
         public void EchoPlayBack(byte[] echoPlayback)
         {
             _canceller.EchoPlayback(echoPlayback);
         }
 
         /// <summary>
-        /// 清理資源
+        /// Dispose resources
         /// </summary>
         public void Dispose()
         {
